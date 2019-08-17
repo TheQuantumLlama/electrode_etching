@@ -8,11 +8,16 @@
 
 
 /********************************************* Defines ********************************************/
+// Changeable program parameters
 #define NUM_CHANNELS 4 // How many wires are you sharpening simultaneously?
-
 #define ETCH_FREQ 10L // Hz, frequency of the etching waveform
+#define PTS_PER_PERIOD 100 // Number of points recorded from every period
+#define STIMULUS_DUTY_CYCLE 50 // %, duty cycle of the etching voltage waveform
+
 // Freq to sample the ADC at (must be <256)
-#define SAMP_FREQ ((F_CPU / ((ETCH_FREQ * 100) * 64)) - 1) // = SYSCLK / (Fs * prescaler) - 1
+#define SAMP_FREQ ((F_CPU / ((ETCH_FREQ * PTS_PER_PERIOD) * 64)) - 1) // = SYSCLK / (Fs * prescaler) - 1
+// How big the ping-pon buffer is, able to save an entire period plus some wiggle room
+#define BUFFER_SIZE (PTS_PER_PERIOD + 10)
 
 
 /*************************************** Public Variables *****************************************/
@@ -24,8 +29,8 @@ uint8_t etching_avg = 0;
 // TODO: Move all of these variables into a proper datastructure
 // Choose ADC channel
 uint8_t ADC_channel = 0;
-// Ping-pong buffers for every channel being used, enough space to hold 1.5 waveform periods
-uint8_t waveform_buffer[2][150] = { 0 };
+// Ping-pong buffers for every channel being used
+uint8_t waveform_buffer[2][BUFFER_SIZE] = { 0 };
 uint8_t buff_cnt =  0;
 // Controls the switching between ping and pong buffers
 bool write_buffer_offset = 0;
@@ -51,8 +56,8 @@ void setup() {
 
   Setup_timer0();
   
-  Empty_Buffer(waveform_buffer[0], 150);
-  Empty_Buffer(waveform_buffer[1], 150);
+  Empty_Buffer(waveform_buffer[0], BUFFER_SIZE);
+  Empty_Buffer(waveform_buffer[1], BUFFER_SIZE);
 
   sei(); // Enable interrupts
 
@@ -63,22 +68,31 @@ void setup() {
   
   // Add together three whole waveforms
   for(int i = 0; i < 3; i++) {
-    Serial.print("Find etch lvl\n");
+    // Serial.print("Find etch lvl\n");
 
     // Wait for a buffer to be ready
     while(!buffer_needs_processing);
 
-    Serial.print("Buf full\n");
+    // Serial.print("Buf full\n");
 
     // Add buffer into etching average
     uint8_t k = 0;
     while(waveform_buffer[read_buffer_offset][k] > 0) {
       waveform_sum += waveform_buffer[read_buffer_offset][k];
       k++;
+      num_pts++;
     }
+
+    Empty_Buffer(waveform_buffer[read_buffer_offset], BUFFER_SIZE);
 
     buffer_needs_processing = false;
   }
+
+  // Serial.print("Wave sum ");
+  // Serial.println(waveform_sum);
+  // Serial.print("Num pts ");
+  // Serial.println(num_pts);
+  
   // Calculate average current level that etching occurs at
   etching_avg = waveform_sum / (uint32_t)num_pts;
 
@@ -89,21 +103,24 @@ void setup() {
 void loop() {
   // Wait until a buffer needs to be processed
   if(buffer_needs_processing) {
+    // Serial.println("Process buf");
 
     // Check if the electrode is finished etching
     int8_t finished_etching =
       Process_Buffer(waveform_buffer[read_buffer_offset], etching_avg);
     
+    Empty_Buffer(waveform_buffer[read_buffer_offset], BUFFER_SIZE);
+
+    buffer_needs_processing = false;
+    
     if(finished_etching == 1) {
       // TODO: Replace this with logic to swap to a new channel and etch the next electrode
       digitalWrite(LED_BUILTIN, HIGH);
-      Serial.print("Etching finished on ");
+      Serial.print("Etching finished on ch ");
       Serial.println(ADC_channel);
 
       while(true);
     }
-
-    buffer_needs_processing = false;
   }
 }
 
@@ -132,7 +149,7 @@ int8_t Process_Buffer(uint8_t * buffer, uint8_t etching_lvl) {
   uint8_t duty_cycle = Check_Duty_Cycle(buffer, etching_upper_limit);
 
   // TODO: Error checking
-  if(duty_cycle < 95) {
+  if(duty_cycle < STIMULUS_DUTY_CYCLE - 1) {
     return 0; // If less than 95% duty, continue applying current
   } else {
     return 1; // If more than 95% duty, cut off current
@@ -151,11 +168,16 @@ uint8_t Check_Duty_Cycle(uint8_t * waveform, uint8_t inactive_lvl) {
   // Count of points in the active part of the cycle
   uint8_t duty_cycle = 0;
 
-  while(waveform > 0) {
+  while(waveform[waveform_cnt] > 0) {
     if(waveform[waveform_cnt++] > inactive_lvl) {
       duty_cycle++;
     }
   }
+
+  Serial.print("Duty Cycl pts ");
+  Serial.println(waveform_cnt);
+  Serial.print("Duty Cycl ");
+  Serial.println(duty_cycle);
 
   // TODO: Create error checking w/ waveform_cnt
   return duty_cycle;
@@ -187,12 +209,11 @@ uint8_t Buffer_To_Serial(uint8_t * buffer, uint8_t len) {
  * ADC chanels are pins 14-17
  */
 ISR(TIMER0_COMPA_vect) {
-  // Serial.write("ISR\n");
   digitalWrite(8, HIGH); // Turn on digital pin for external timing
 
   // Read ADC of current channel (TODO: ~13 cycles by datasheet but builtin is much longer)
   // 10 bit ADC, analogRead returns a 16 bit number
-  //   shift upper 2 bits into the lower 8 (lose 2 LSBs) and cast to 8 bits
+  // Shift upper 2 bits into the lower 8 (lose 2 LSBs) and cast to 8 bits,
   //   removing upper 8 bits (all 0s)
   uint8_t tmp = analogRead(ADC_channel) >> 2;
   // Serial.println(tmp);
@@ -202,9 +223,10 @@ ISR(TIMER0_COMPA_vect) {
     waveform_buffer[write_buffer_offset][buff_cnt] = tmp;
     buff_cnt++;
 
-  } else if(!buffer_needs_processing) {
-    // (tmp < ADC_NEAR_0) condition implicit, check if counterpart buffer is waiting to be
-    //   processed, only proceed if it is not
+  } else if(buff_cnt != 0 && !buffer_needs_processing) {
+    // (tmp < ADC_NEAR_0) condition implicit
+    // Check if current buffer has anything in it
+    // Check if counterpart buffer is waiting to be processed, only proceed if it is not
 
     buffer_needs_processing = true; // Set process flag for whatever buffer was just finished
     write_buffer_offset = !write_buffer_offset; // Switch to filling the unused buffer
@@ -214,8 +236,8 @@ ISR(TIMER0_COMPA_vect) {
     Serial.print("ISR: Buf swp\n");
 
   } else {
-    // If previous buffer has not been processed, reset the buffer counter and fill the same
-    //   buffer again
+    // If buffer empty or previous buffer has not been processed, 
+    //   reset the buffer counter and fill the current buffer
 
     buff_cnt = 0;
   }
